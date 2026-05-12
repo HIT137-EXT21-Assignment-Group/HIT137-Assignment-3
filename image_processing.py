@@ -28,7 +28,7 @@ class ImageProcessor:
     ALTERATION_TYPES = [
         "colour_shift",
         "brightness_patch",
-        "channel_swap",
+        "edge_overlay",
         "gaussian_blur",
     ]
 
@@ -269,58 +269,95 @@ class ImageProcessor:
 
     def apply_colour_shift(self, region: tuple):
         """
-        Shifts the hue of a region by 40–80° in HSV space.
-        Keeps brightness and saturation intact → subtle but visible
-        upon careful inspection (not glaringly obvious).
+        Shifts the hue of a region by 40–80° in HSV space using OpenCV.
+        Auto-detects greyscale regions: if saturation is too low for
+        hue shift to be visible, falls back to cv2.bitwise_not which
+        inverts intensity (works on white AND black backgrounds).
         """
         x, y, w, h = region
         roi = self.modified[y:y+h, x:x+w]
 
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV).astype(np.int16)
-        shift = random.randint(30, 60)          # 40-80° hue shift
-        hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
-        hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+        # Check saturation — if low, hue shift is invisible (greyscale region)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mean_saturation = float(np.mean(hsv[:, :, 1]))
 
-        self.modified[y:y+h, x:x+w] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        if mean_saturation < 15:
+            # Greyscale region — invert intensity using OpenCV
+            # Works on both white (→ dark) and black (→ light) backgrounds
+            inverted = cv2.bitwise_not(roi)
+            # Blend gently so it's "subtle" not glaring (OpenCV addWeighted)
+            blended = cv2.addWeighted(roi, 0.35, inverted, 0.65, 0)
+            self.modified[y:y+h, x:x+w] = blended
+        else:
+            # Colour region — do the standard hue shift via HSV
+            hsv = hsv.astype(np.int16)
+            shift = random.randint(40, 80)
+            hsv[:, :, 0] = (hsv[:, :, 0] + shift) % 180
+            hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+            self.modified[y:y+h, x:x+w] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     def apply_brightness_patch(self, region: tuple):
         """
-        Subtly brightens or darkens a region by 40–70 units.
-        Amount chosen to be noticeable but not immediately obvious.
-        """
-        x, y, w, h = region
-        roi = self.modified[y:y+h, x:x+w].astype(np.int16)
-
-        direction = random.choice([1, -1])
-        amount    = random.randint(30, 55)      # subtle range 40, 70
-        roi       = np.clip(roi + direction * amount, 0, 255).astype(np.uint8)
-
-        self.modified[y:y+h, x:x+w] = roi
-
-    def apply_channel_swap(self, region: tuple):
-        """
-        Swaps the Red and Blue colour channels.
-        Produces a clear but not glaringly obvious tint change
-        (e.g. warm → cool tones).
-        """
-        x, y, w, h = region
-        roi     = self.modified[y:y+h, x:x+w].copy()
-        swapped = roi.copy()
-        swapped[:, :, 0] = roi[:, :, 2]    # B ← original R
-        swapped[:, :, 2] = roi[:, :, 0]    # R ← original B
-        self.modified[y:y+h, x:x+w] = swapped
-
-    def apply_gaussian_blur(self, region: tuple):
-        """
-        Applies a noticeable Gaussian blur to a region (kernel 21×21, sigma 8).
-        Creates a clearly soft/out-of-focus patch that is subtle but findable
-        on any image with texture or edges.
+        Subtly brightens or darkens a region using OpenCV.
+        Uses cv2.convertScaleAbs() which is OpenCV's built-in
+        brightness/contrast operation (beta = brightness offset).
+        Works on greyscale and colour images alike.
         """
         x, y, w, h = region
         roi = self.modified[y:y+h, x:x+w]
-        # kernel 21×21 with sigma=8 is strong enough to be visible on
-        # textured real photos while remaining subtle on flat regions
+
+        direction = random.choice([1, -1])
+        amount    = random.randint(40, 70)
+        beta      = direction * amount
+
+        # cv2.convertScaleAbs handles clamping internally
+        brightened = cv2.convertScaleAbs(roi, alpha=1.0, beta=beta)
+        self.modified[y:y+h, x:x+w] = brightened
+
+    def apply_edge_overlay(self, region: tuple):
+        """
+        Uses OpenCV's Canny edge detector + addWeighted to subtly
+        embed detected edges into the region.
+        Works on ANY image — colour, greyscale, light or dark backgrounds —
+        because Canny detects intensity changes, not colour.
+        Replaces channel_swap (which fails on greyscale images).
+        """
+        x, y, w, h = region
+        roi = self.modified[y:y+h, x:x+w]
+
+        # Step 1: Canny edge detection (OpenCV)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, threshold1=50, threshold2=150)
+
+        # Step 2: Dilate edges so they're more visible (OpenCV morphology)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        edges = cv2.dilate(edges, kernel, iterations=1)
+
+        # Step 3: Convert to 3-channel and blend with original (OpenCV)
+        edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        blended = cv2.addWeighted(roi, 0.75, edges_bgr, 0.45, 0)
+
+        self.modified[y:y+h, x:x+w] = blended
+
+    def apply_gaussian_blur(self, region: tuple):
+        """
+        Applies a Gaussian blur using OpenCV (kernel 21×21, sigma 8).
+        Combined with a tiny brightness nudge so the change remains
+        visible even on flat-coloured regions where blur alone produces
+        identical pixels.
+        Creates a softly out-of-focus and slightly shaded patch.
+        """
+        x, y, w, h = region
+        roi = self.modified[y:y+h, x:x+w]
+
+        # Step 1: Gaussian blur (OpenCV)
         blurred = cv2.GaussianBlur(roi, (21, 21), sigmaX=8)
+
+        # Step 2: Slight brightness nudge so flat regions still differ
+        # cv2.convertScaleAbs is OpenCV's brightness adjustment
+        direction = random.choice([1, -1])
+        blurred = cv2.convertScaleAbs(blurred, alpha=1.0, beta=direction * 15)
+
         self.modified[y:y+h, x:x+w] = blurred
 
     # SAVE
@@ -381,7 +418,7 @@ class ImageProcessor:
         dispatch = {
             "colour_shift"    : self.apply_colour_shift,
             "brightness_patch": self.apply_brightness_patch,
-            "channel_swap"    : self.apply_channel_swap,
+            "edge_overlay"    : self.apply_edge_overlay,
             "gaussian_blur"   : self.apply_gaussian_blur,
         }
         if alteration_type not in dispatch:
@@ -412,12 +449,34 @@ class ImageProcessor:
     def get_region_centres(self) -> list:
         """
         Return (cx, cy) centre of each region in display coordinates.
-        Used by Member 2's GameState for proximity-based click detection.
+        Used by Asim's GameState for proximity-based click detection.
         """
         return [
             (x + w // 2, y + h // 2)
             for (x, y, w, h, _) in self.regions
         ]
+
+    @staticmethod
+    def to_tk_image(numpy_image):
+        """
+        Convert an OpenCV BGR numpy array to a Tkinter-displayable
+        PhotoImage. 
+        ─────────────────────────────────
+        Tkinter does NOT keep a strong reference to PhotoImage objects.
+        If the returned image is not stored as an attribute of a
+        long-lived object (e.g. self.orig_tk = processor.to_tk_image(...)),
+        Python's garbage collector will destroy it immediately and
+        the canvas will appear blank — even though circles drawn AFTER
+        will still be visible.
+
+        Correct usage:
+            self.orig_tk = ImageProcessor.to_tk_image(orig_disp)
+            self.canvas.create_image(0, 0, anchor='nw', image=self.orig_tk)
+        """
+        from PIL import Image, ImageTk
+        rgb = cv2.cvtColor(numpy_image, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        return ImageTk.PhotoImage(pil_img)
 
     def list_folder_contents(self):
         """Print a summary of all image files in the working folder."""
@@ -476,7 +535,7 @@ def run_demo():
     COLOURS = {
         "colour_shift"    : (0,   255, 255),  # yellow
         "brightness_patch": (255, 165,   0),  # orange
-        "channel_swap"    : (0,   255,   0),  # green
+        "edge_overlay"    : (0,   255,   0),  # green
         "gaussian_blur"   : (255,   0, 255),  # magenta
     }
 
